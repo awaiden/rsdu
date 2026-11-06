@@ -45,6 +45,7 @@ rsdu -I '.*\.log' /var    # skip paths matching a regex (files and directories)
 | `a`                                   | toggle apparent size / disk usage                      |
 | `c` `m`                               | show item count / mtime column                         |
 | `s` `C` `n` `M`                       | sort by size / count / name / mtime (again to reverse) |
+| `i`                                   | item info (path, sizes, mtime, owner, links)           |
 | `d`                                   | delete (asks for confirmation)                         |
 | `?` / `q`                             | help / quit                                            |
 

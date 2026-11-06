@@ -21,6 +21,8 @@ pub struct Cfg {
     pub no_color: bool,
     pub no_unicode: bool,
     pub no_delete: bool,
+    /// Scanned from the live filesystem (not imported), so item paths can be stat'ed.
+    pub live: bool,
 }
 
 pub enum Source {
@@ -54,6 +56,8 @@ struct App {
     desc: bool,
     confirm: bool,
     help: bool,
+    /// Lines of the open info window.
+    info: Option<Vec<String>>,
     scanning: Option<Scanning>,
     deleting: Option<Deleting>,
     /// (text, is_error)
@@ -91,20 +95,7 @@ fn tail(s: &str, w: usize) -> String {
 }
 
 pub fn run(src: Source, cfg: Cfg) -> io::Result<()> {
-    let mut app = App {
-        root: Item::default(),
-        path: vec![],
-        sel: ListState::default(),
-        cfg,
-        by: SortBy::Size,
-        desc: true,
-        confirm: false,
-        help: false,
-        scanning: None,
-        deleting: None,
-        status: None,
-        dirty: true,
-    };
+    let mut app = App::new(cfg);
     match src {
         Source::Ready(root) => app.set_root(root),
         Source::Scanning(handle, prog, path) => {
@@ -185,6 +176,67 @@ impl App {
         frames[(since.elapsed().as_millis() / 100) as usize % frames.len()]
     }
 
+    fn new(cfg: Cfg) -> Self {
+        Self {
+            root: Item::default(),
+            path: vec![],
+            sel: ListState::default(),
+            cfg,
+            by: SortBy::Size,
+            desc: true,
+            confirm: false,
+            help: false,
+            info: None,
+            scanning: None,
+            deleting: None,
+            status: None,
+            dirty: true,
+        }
+    }
+
+    /// Lines for the info window of child `idx` of the current directory.
+    fn info_lines(&self, idx: usize) -> Vec<String> {
+        let it = &cur(&self.root, &self.path).children()[idx];
+        let p = self.root.path_of(&self.path, idx);
+        let l = |k: &str, v: String| format!("  {k:<14}{v}");
+        let kind = match (it.is_dir(), it.flag()) {
+            (true, _) => "directory",
+            (_, '@') => "symlink / special file",
+            (_, 'H') => "file (hardlink)",
+            _ => "file",
+        };
+        let mut v = vec![
+            l("Name", it.name.to_string()),
+            l("Path", tail(&p.to_string_lossy(), 54)),
+            l("Type", kind.into()),
+            l("Disk usage", self.cfg.fmt.size(it.usage)),
+            l("Apparent size", self.cfg.fmt.size(it.size)),
+        ];
+        if it.is_dir() {
+            v.push(l("Items", fmt::count(it.display_count())));
+        }
+        v.push(l("Modified", mtime_str(it.mtime)));
+        let status = match it.flag() {
+            '!' => Some("! read error"),
+            '.' => Some(". error in a subdirectory"),
+            'e' => Some("e empty directory"),
+            _ => None,
+        };
+        if let Some(s) = status {
+            v.push(l("Status", s.into()));
+        }
+        if self.cfg.live
+            && let Ok(m) = std::fs::symlink_metadata(&p)
+        {
+            use std::os::unix::fs::MetadataExt;
+            v.push(l("Links", m.nlink().to_string()));
+            v.push(l("Inode", m.ino().to_string()));
+            v.push(l("Owner", format!("{}:{}", m.uid(), m.gid())));
+            v.push(l("Mode", format!("{:04o}", m.mode() & 0o7777)));
+        }
+        v
+    }
+
     fn metric(&self, i: &Item) -> i64 {
         if self.cfg.apparent { i.size } else { i.usage }
     }
@@ -257,8 +309,9 @@ impl App {
             return false; // busy: ignore keys until the delete finishes
         }
         self.status = None;
-        if self.help {
+        if self.help || self.info.is_some() {
             self.help = false;
+            self.info = None;
             return false;
         }
         if self.confirm {
@@ -273,6 +326,7 @@ impl App {
         match code {
             KeyCode::Char('q' | 'Q') => return true,
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('i') if n > 0 => self.info = Some(self.info_lines(i)),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.sel.select(Some((i + 1).min(n.saturating_sub(1))))
             }
@@ -558,6 +612,19 @@ impl App {
                 lines,
             );
         }
+        if let Some(v) = &self.info {
+            let mut lines: Vec<Line> = v.iter().map(|s| Line::from(s.as_str())).collect();
+            lines.push(Line::from(""));
+            lines.push(Line::from("  press any key to close"));
+            popup(
+                f,
+                72,
+                lines.len() as u16 + 2,
+                " Info ",
+                self.st(Style::default().fg(Color::Cyan)),
+                lines,
+            );
+        }
         if self.help {
             let k = |a: &str, b: &str| Line::from(format!("  {a:<18}{b}"));
             let lines = vec![
@@ -569,6 +636,7 @@ impl App {
                 k("c  m", "item count / mtime column"),
                 k("s C n M", "sort by size/count/name/mtime"),
                 k("", "(again = reverse)"),
+                k("i", "item info"),
                 k("d", "delete"),
                 k("q", "quit"),
                 Line::from(""),
@@ -599,4 +667,54 @@ fn popup(f: &mut Frame, w: u16, h: u16, title: &str, border: Style, lines: Vec<L
         Paragraph::new(lines).block(Block::bordered().title(title).border_style(border)),
         r,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn screen(app: &mut App) -> String {
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| app.draw(f)).unwrap();
+        t.backend().to_string()
+    }
+
+    #[test]
+    fn info_window_shows_file_and_dir() {
+        let mut root = Item::new_dir("/r", ' ');
+        root.children_mut()
+            .push(Item::new_file("f.txt", 'H', 100, 4096, 0, 7));
+        let mut sub = Item::new_dir("sub", ' ');
+        sub.children_mut()
+            .push(Item::new_file("x", ' ', 1, 4096, 0, 0));
+        root.children_mut().push(sub);
+        root.update_stats();
+        let mut app = App::new(Cfg {
+            fmt: Fmt::default(),
+            apparent: false,
+            show_count: false,
+            show_mtime: false,
+            no_color: true,
+            no_unicode: true,
+            no_delete: false,
+            live: false,
+        });
+        app.set_root(root);
+        for (name, want) in [("f.txt", "file (hardlink)"), ("sub", "directory")] {
+            let i = cur(&app.root, &app.path)
+                .children()
+                .iter()
+                .position(|c| &*c.name == name)
+                .unwrap();
+            app.sel.select(Some(i));
+            app.key(KeyCode::Char('i'));
+            let out = screen(&mut app);
+            assert!(out.contains(want), "{out}");
+            assert!(out.contains(&format!("/r/{name}")), "{out}");
+            assert!(out.contains("1970-01-01"), "{out}");
+            app.key(KeyCode::Char('x'));
+            assert!(app.info.is_none());
+        }
+    }
 }

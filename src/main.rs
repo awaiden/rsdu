@@ -180,6 +180,7 @@ fn main() {
         no_unicode: a.no_unicode,
         // an imported file's names are not guaranteed to exist on this machine
         no_delete: a.no_delete || a.input_file.is_some(),
+        live: a.input_file.is_none(),
     };
 
     let mut root = if let Some(f) = &a.input_file {
