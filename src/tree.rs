@@ -5,7 +5,8 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::ops::Deref;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 /// Apparent size gdu gives an empty directory.
 pub const EMPTY_DIR_SIZE: i64 = 512;
@@ -21,6 +22,15 @@ pub fn fold_dev(dev: u64) -> u32 {
 pub enum SmallStr {
     Inline(u8, [u8; 22]),
     Heap(Box<str>),
+    /// Name that is not valid UTF-8: `display` is the lossy form shown on screen,
+    /// `bytes` the real name used to open or delete the file.
+    Raw(Box<RawName>),
+}
+
+#[derive(Clone)]
+pub struct RawName {
+    display: Box<str>,
+    bytes: Box<[u8]>,
 }
 
 impl SmallStr {
@@ -32,6 +42,16 @@ impl SmallStr {
                 unsafe { std::str::from_utf8_unchecked(&buf[..*len as usize]) }
             }
             Self::Heap(s) => s,
+            Self::Raw(r) => &r.display,
+        }
+    }
+
+    /// The real on-disk name (differs from `as_str` only for `Raw`).
+    #[inline]
+    pub fn as_os_str(&self) -> &OsStr {
+        match self {
+            Self::Raw(r) => OsStr::from_bytes(&r.bytes),
+            _ => OsStr::new(self.as_str()),
         }
     }
 
@@ -39,7 +59,10 @@ impl SmallStr {
     pub fn from_utf8_lossy(bytes: &[u8]) -> Self {
         match std::str::from_utf8(bytes) {
             Ok(s) => Self::from(s),
-            Err(_) => Self::from(String::from_utf8_lossy(bytes).into_owned()),
+            Err(_) => Self::Raw(Box::new(RawName {
+                display: String::from_utf8_lossy(bytes).into(),
+                bytes: bytes.into(),
+            })),
         }
     }
 }
@@ -69,14 +92,14 @@ impl AsRef<str> for SmallStr {
 impl AsRef<OsStr> for SmallStr {
     #[inline]
     fn as_ref(&self) -> &OsStr {
-        OsStr::new(self.as_str())
+        self.as_os_str()
     }
 }
 
 impl AsRef<Path> for SmallStr {
     #[inline]
     fn as_ref(&self) -> &Path {
-        Path::new(self.as_str())
+        Path::new(self.as_os_str())
     }
 }
 
@@ -143,8 +166,8 @@ impl From<SmallStr> for String {
     #[inline]
     fn from(s: SmallStr) -> Self {
         match s {
-            SmallStr::Inline(_, _) => s.as_str().to_owned(),
             SmallStr::Heap(b) => b.into_string(),
+            _ => s.as_str().to_owned(),
         }
     }
 }
@@ -501,6 +524,18 @@ impl Item {
         self.update_stats();
     }
 
+    /// Real filesystem path of child `idx` of the dir at `path` (self is the scan root).
+    pub fn path_of(&self, path: &[usize], idx: usize) -> PathBuf {
+        let mut p = PathBuf::from(&self.name);
+        let mut d = self;
+        for &i in path {
+            d = &d.children()[i];
+            p.push(&d.name);
+        }
+        p.push(&d.children()[idx].name);
+        p
+    }
+
     pub fn dir_at(&mut self, path: &[usize]) -> &mut Item {
         path.iter().fold(self, |d, &i| &mut d.children_mut()[i])
     }
@@ -519,6 +554,14 @@ mod tests {
         d.dir_ext_mut().unwrap().dev = dev;
         *d.children_mut() = kids;
         d
+    }
+
+    #[test]
+    fn raw_name_keeps_bytes() {
+        let n = SmallStr::from_utf8_lossy(b"bad\xffname");
+        assert_eq!(n.as_os_str().as_bytes(), b"bad\xffname");
+        assert_eq!(n.as_str(), "bad\u{fffd}name");
+        assert_eq!(SmallStr::from_utf8_lossy(b"ok").as_os_str(), "ok");
     }
 
     #[test]

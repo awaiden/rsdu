@@ -130,9 +130,8 @@ pub fn scan(path: &Path, opts: &Opts, prog: &Progress) -> Item {
     let keep_depth = scoped_opts.max_depth.unwrap_or(usize::MAX);
     match scan_dir(
         None,
-        Some(path.as_os_str()),
         Some(path),
-        SmallStr::from(root_str),
+        SmallStr::from_utf8_lossy(path.as_os_str().as_bytes()),
         0,
         keep_depth,
         need_path,
@@ -160,7 +159,6 @@ enum ScanOut {
 
 struct SubdirEntry {
     name: SmallStr,
-    raw_os: Option<Box<OsStr>>,
     path: Option<PathBuf>,
     pre_stat: Option<(u64, i64, i64)>,
 }
@@ -222,17 +220,10 @@ fn process_entry(
         } else {
             None
         };
-        let (fname, raw_os) = match std::str::from_utf8(bytes) {
-            Ok(s) => (SmallStr::from(s), None),
-            Err(_) => (
-                SmallStr::from(String::from_utf8_lossy(bytes).into_owned()),
-                Some(Box::from(OsStr::from_bytes(bytes))),
-            ),
-        };
+        let fname = SmallStr::from_utf8_lossy(bytes);
         let pre_stat = st.map(|s| (s.st_dev as u64, s.st_mtime as i64, s.st_blocks as i64));
         subdirs.push(SubdirEntry {
             name: fname,
-            raw_os,
             path: p,
             pre_stat,
         });
@@ -367,7 +358,6 @@ fn read_entries(
 #[allow(clippy::too_many_arguments)]
 fn scan_dir(
     parent_fd: Option<BorrowedFd<'_>>,
-    raw_os: Option<&OsStr>,
     path: Option<&Path>,
     name: SmallStr,
     depth: usize,
@@ -379,7 +369,7 @@ fn scan_dir(
     prog: &Progress,
 ) -> Option<ScanOut> {
     let oflags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let open_name: &OsStr = raw_os.unwrap_or_else(|| OsStr::new(name.as_str()));
+    let open_name: &OsStr = name.as_os_str();
     let fd = match parent_fd {
         Some(pfd) => openat(pfd, open_name, oflags | OFlags::NOFOLLOW, Mode::empty()).ok(),
         None => openat(CWD, open_name, oflags, Mode::empty()).ok(),
@@ -483,7 +473,6 @@ fn scan_dir(
     let scan_sub = |s: SubdirEntry| {
         scan_dir(
             Some(pfd),
-            s.raw_os.as_deref(),
             s.path.as_deref(),
             s.name,
             depth + 1,
@@ -683,6 +672,28 @@ mod tests {
             assert_eq!(size("b"), 5000);
             assert_eq!(r.size, 5000);
         }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn non_utf8_names_resolve_to_real_paths() {
+        let d = std::env::temp_dir().join(format!("rsdu-raw-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let bad_dir = d.join(OsStr::from_bytes(b"dir\xfe"));
+        fs::create_dir_all(&bad_dir).unwrap();
+        fs::write(d.join(OsStr::from_bytes(b"bad\xffname")), b"x").unwrap();
+        fs::write(bad_dir.join(OsStr::from_bytes(b"in\xff")), b"y").unwrap();
+        let r = scan(&d, &Opts::default(), &Progress::default());
+        assert_eq!(r.items(), 4);
+        for i in 0..r.children().len() {
+            assert!(fs::symlink_metadata(r.path_of(&[], i)).is_ok());
+        }
+        let di = r
+            .children()
+            .iter()
+            .position(|c| c.name.as_os_str().as_bytes() == b"dir\xfe")
+            .unwrap();
+        assert!(fs::symlink_metadata(r.path_of(&[di], 0)).is_ok());
         fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -327,22 +327,11 @@ impl App {
         false
     }
 
-    fn real_path(&self, idx: usize) -> std::path::PathBuf {
-        let mut p = std::path::PathBuf::from(&self.root.name);
-        let mut d = &self.root;
-        for &i in &self.path {
-            d = &d.children()[i];
-            p.push(&d.name);
-        }
-        p.push(&d.children()[idx].name);
-        p
-    }
-
     fn start_delete(&mut self) {
         let Some(idx) = self.sel.selected() else {
             return;
         };
-        let p = self.real_path(idx);
+        let p = self.root.path_of(&self.path, idx);
         let item = &cur(&self.root, &self.path).children()[idx];
         let (name, size) = (item.name.to_string(), self.metric(item));
         let handle = std::thread::spawn(move || {
