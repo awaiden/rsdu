@@ -104,17 +104,16 @@ fn file_item_st(name: SmallStr, st: &Stat) -> Item {
 
 /// Raise soft file descriptor limit so deep parallel parent-FD traversal never hits EMFILE.
 fn raise_fd_limit() {
-    unsafe {
-        let mut rlim: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur < rlim.rlim_max {
-            // On macOS, OPEN_MAX (10240) is the cap for unprivileged setrlimit
-            #[cfg(target_os = "macos")]
-            let target = rlim.rlim_max.min(10240);
-            #[cfg(not(target_os = "macos"))]
-            let target = rlim.rlim_max;
-            rlim.rlim_cur = target;
-            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
-        }
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    let mut rlim = getrlimit(Resource::Nofile);
+    if rlim.current < rlim.maximum {
+        // On macOS, OPEN_MAX (10240) is the cap for unprivileged setrlimit
+        #[cfg(target_os = "macos")]
+        let target = rlim.maximum.map(|m| m.min(10240));
+        #[cfg(not(target_os = "macos"))]
+        let target = rlim.maximum;
+        rlim.current = target;
+        let _ = setrlimit(Resource::Nofile, rlim);
     }
 }
 

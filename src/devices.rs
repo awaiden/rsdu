@@ -1,4 +1,3 @@
-use std::ffi::CString;
 
 pub struct Device {
     pub name: String,
@@ -33,13 +32,9 @@ pub fn list() -> std::io::Result<Vec<Device>> {
         {
             continue;
         }
-        let Ok(c) = CString::new(mount.clone()) else {
+        let Ok(st) = rustix::fs::statvfs(mount.as_str()) else {
             continue;
         };
-        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-            continue;
-        }
         let bs = st.f_frsize as i64;
         out.push(Device {
             name: name.into(),

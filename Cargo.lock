@@ -1283,8 +1283,6 @@ name = "rsdu"
 version = "0.1.1"
 dependencies = [
  "clap",
- "crossterm",
- "libc",
  "ratatui",
  "rayon",
  "regex",
