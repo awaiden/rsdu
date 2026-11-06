@@ -1,4 +1,3 @@
-
 pub struct Device {
     pub name: String,
     pub mount: String,
