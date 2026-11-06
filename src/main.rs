@@ -28,7 +28,7 @@ struct Args {
     #[arg(
         long,
         value_delimiter = ',',
-        help = "Export only selected JSON attributes (name,asize,dsize,shsize,items,mtime,notreg,ino)"
+        help = "Export only selected JSON attributes (name,asize,dsize,mtime,notreg,ino)"
     )]
     output_attrs: Vec<String>,
     #[arg(short = 'f', long, help = "Import analysis from JSON file")]
@@ -42,8 +42,7 @@ struct Args {
     #[arg(
         short = 'I',
         long,
-        value_delimiter = ',',
-        help = "Regex patterns of paths to ignore"
+        help = "Regex for paths to ignore (files and directories); repeat the flag for several"
     )]
     ignore_dirs_pattern: Vec<String>,
     #[arg(
@@ -126,9 +125,10 @@ fn main() {
             "Device", "Size", "Used", "Free", "Used%"
         );
         for d in devs {
-            let used = d.size - d.free;
-            let pct = if d.size > 0 {
-                (used as f64 / d.size as f64 * 100.0).round()
+            let used = d.used;
+            // like df: percentage of used + available, rounded up
+            let pct = if used + d.free > 0 {
+                (used as f64 / (used + d.free) as f64 * 100.0).ceil()
             } else {
                 0.0
             };
@@ -178,7 +178,8 @@ fn main() {
         show_mtime: a.show_mtime,
         no_color: a.no_color,
         no_unicode: a.no_unicode,
-        no_delete: a.no_delete,
+        // an imported file's names are not guaranteed to exist on this machine
+        no_delete: a.no_delete || a.input_file.is_some(),
     };
 
     let mut root = if let Some(f) = &a.input_file {

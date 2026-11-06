@@ -30,7 +30,8 @@ rsdu -n -t 10 /usr        # 10 largest files
 rsdu -n --depth 2 .       # tree two levels deep
 rsdu -d                   # mounted disks
 rsdu -o out.json .        # export JSON (ncdu format)
-rsdu -f out.json          # browse an export
+rsdu -f out.json          # browse an export (read-only: deleting is disabled)
+rsdu -I '.*\.log' /var    # skip paths matching a regex (files and directories)
 ```
 
 `rsdu --help` lists every flag. Flags follow the names and short letters used by gdu where ncdu has no equivalent.
@@ -48,6 +49,15 @@ rsdu -f out.json          # browse an export
 | `?` / `q`                             | help / quit                                            |
 
 Use `--no-delete` to disable deletion.
+
+### JSON export
+
+`rsdu -o` writes ncdu's export format, so the file loads in ncdu (`ncdu -f out.json`) and
+rsdu reads ncdu's files (`ncdu -o out.json DIR`, then `rsdu -f out.json`). As in ncdu, a
+directory entry holds only the directory's own size and readers add up the children. Files
+written by gdu and by rsdu 0.1.0 (which wrote cumulative directory totals) are still imported
+correctly. `-I` can be repeated for several patterns and applies to files as well as
+directories; use `-X FILE` to read many patterns from a file.
 
 ## Benchmarks
 

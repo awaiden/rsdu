@@ -10,6 +10,12 @@ use std::path::Path;
 /// Apparent size gdu gives an empty directory.
 pub const EMPTY_DIR_SIZE: i64 = 512;
 
+/// Fold a 64-bit `st_dev` into the 32 bits stored per item (hardlink identity is `(dev, ino)`).
+#[inline]
+pub fn fold_dev(dev: u64) -> u32 {
+    (dev ^ (dev >> 32)) as u32
+}
+
 /// 24-byte string that stores names <= 22 bytes inline on the stack without heap allocation.
 #[derive(Clone)]
 pub enum SmallStr {
@@ -258,6 +264,9 @@ pub struct DirExt {
     pub own_usage: i64,
     /// Stats came from a JSON import; do not recompute.
     pub fixed_stats: bool,
+    /// Device of this directory (folded to 32 bits, see `fold_dev`). Files inside live on the
+    /// same device, so hardlink identity is `(dir dev, ino)` and no per-file device is stored.
+    pub dev: u32,
 }
 
 impl Default for DirExt {
@@ -268,6 +277,7 @@ impl Default for DirExt {
             items: 1,
             own_usage: 0,
             fixed_stats: false,
+            dev: 0,
         }
     }
 }
@@ -399,6 +409,14 @@ impl Item {
     }
 
     #[inline]
+    pub fn dir_ext(&self) -> Option<&DirExt> {
+        match &self.kind {
+            Kind::Dir { ext, .. } => Some(ext),
+            Kind::File { .. } => None,
+        }
+    }
+
+    #[inline]
     pub fn dir_ext_mut(&mut self) -> Option<&mut DirExt> {
         match &mut self.kind {
             Kind::Dir { ext, .. } => Some(ext),
@@ -415,9 +433,9 @@ impl Item {
         }
     }
 
-    /// Recompute dir totals bottom-up. Every directory counts a hardlinked inode once within
-    /// its own subtree; returns the inodes found below so the parent can do the same.
-    pub fn update_stats(&mut self) -> LinkMap<u64> {
+    /// Recompute dir totals bottom-up. Every directory counts a hardlinked file (`(dir dev, ino)`)
+    /// once within its own subtree; returns the links found below so the parent can do the same.
+    pub fn update_stats(&mut self) -> LinkMap<(u32, u64)> {
         let Kind::Dir { ext, flag } = &mut self.kind else {
             return LinkMap::default();
         };
@@ -427,13 +445,14 @@ impl Item {
         let (mut size, mut usage, mut items) = (0, 0, 1);
         let mut links = LinkMap::default();
         let mut max_mtime = self.mtime;
+        let dev = ext.dev;
         for c in &mut ext.children {
             let child_links = c.update_stats();
             size += c.size;
             usage += c.usage;
             merge_links(&mut size, &mut usage, &mut links, child_links);
             let ino = c.ino();
-            if ino != 0 && links.insert(ino, (c.size, c.usage)).is_some() {
+            if ino != 0 && links.insert((dev, ino), (c.size, c.usage)).is_some() {
                 size -= c.size;
                 usage -= c.usage;
             }
@@ -446,6 +465,9 @@ impl Item {
         }
         if ext.children.is_empty() {
             size += EMPTY_DIR_SIZE;
+            if *flag == ' ' {
+                *flag = 'e';
+            }
         }
         self.size = size;
         self.usage = usage + ext.own_usage;
@@ -472,27 +494,73 @@ impl Item {
         });
     }
 
-    /// Remove child `idx` of the dir at `path`, subtracting its totals from that dir and its ancestors.
+    /// Remove child `idx` of the dir at `path`, then recompute every total from the tree.
+    /// Recomputing (instead of subtracting) keeps hardlinks, empty directories and flags exact.
     pub fn delete_child(&mut self, path: &[usize], idx: usize) {
-        let c = &self.dir_at(path).children()[idx];
-        let (size, usage, items) = (c.size, c.usage, c.items());
-        self.subtract_along(path, size, usage, items);
         self.dir_at(path).children_mut().remove(idx);
+        self.update_stats();
     }
 
     pub fn dir_at(&mut self, path: &[usize]) -> &mut Item {
         path.iter().fold(self, |d, &i| &mut d.children_mut()[i])
     }
+}
 
-    /// Subtract `size/usage/items` from every dir along `path` (excluding the leaf dir itself).
-    pub fn subtract_along(&mut self, path: &[usize], size: i64, usage: i64, items: i64) {
-        self.size -= size;
-        self.usage -= usage;
-        if let Some(ext) = self.dir_ext_mut() {
-            ext.items -= items;
-        }
-        if let Some((&first, rest)) = path.split_first() {
-            self.children_mut()[first].subtract_along(rest, size, usage, items);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str, ino: u64) -> Item {
+        Item::new_file(name, if ino != 0 { 'H' } else { ' ' }, 100, 4096, 1, ino)
+    }
+
+    fn dir(name: &str, dev: u32, kids: Vec<Item>) -> Item {
+        let mut d = Item::new_dir(name, ' ');
+        d.dir_ext_mut().unwrap().dev = dev;
+        *d.children_mut() = kids;
+        d
+    }
+
+    #[test]
+    fn item_stays_one_cache_line() {
+        assert_eq!(std::mem::size_of::<Item>(), 64);
+    }
+
+    #[test]
+    fn deleting_one_hardlink_name_keeps_the_size() {
+        let a = dir("a", 1, vec![file("f1", 5), file("f2", 5)]);
+        let mut root = dir("r", 1, vec![a]);
+        root.update_stats();
+        assert_eq!(root.usage, 4096);
+        root.delete_child(&[0], 0); // remove f1; f2 still occupies the inode
+        assert_eq!((root.children()[0].usage, root.usage), (4096, 4096));
+        root.delete_child(&[0], 0); // remove f2: the directory is empty now
+        let a = &root.children()[0];
+        assert_eq!((a.size, a.usage, a.flag()), (EMPTY_DIR_SIZE, 0, 'e'));
+        assert_eq!(root.size, EMPTY_DIR_SIZE);
+    }
+
+    #[test]
+    fn same_inode_on_different_devices_is_two_files() {
+        let mut root = dir(
+            "r",
+            0,
+            vec![
+                dir("a", 1, vec![file("x", 5)]),
+                dir("b", 2, vec![file("y", 5)]),
+            ],
+        );
+        root.update_stats();
+        assert_eq!(root.usage, 8192);
+        let mut same_dev = dir(
+            "r",
+            0,
+            vec![
+                dir("a", 3, vec![file("x", 5)]),
+                dir("b", 3, vec![file("y", 5)]),
+            ],
+        );
+        same_dev.update_stats();
+        assert_eq!(same_dev.usage, 4096);
     }
 }

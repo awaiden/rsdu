@@ -2,7 +2,7 @@
 #![allow(clippy::unnecessary_cast)]
 
 use crate::ignore::Ignore;
-use crate::tree::{EMPTY_DIR_SIZE, Item, LinkMap, SmallStr, merge_links};
+use crate::tree::{EMPTY_DIR_SIZE, Item, LinkMap, SmallStr, fold_dev, merge_links};
 use rayon::prelude::*;
 use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 #[cfg(not(target_os = "linux"))]
@@ -148,14 +148,14 @@ pub fn scan(path: &Path, opts: &Opts, prog: &Progress) -> Item {
 }
 
 enum ScanOut {
-    Node(Item, LinkMap<(u64, u64)>),
+    Node(Item, LinkMap<(u32, u64)>),
     Stats {
         size: i64,
         usage: i64,
         items: i64,
         mtime: i64,
         flag: char,
-        links: LinkMap<(u64, u64)>,
+        links: LinkMap<(u32, u64)>,
     },
 }
 
@@ -175,7 +175,9 @@ struct DirAcc {
     entry_count: u64,
     had_entries: bool,
     flag: char,
-    links: LinkMap<(u64, u64)>,
+    links: LinkMap<(u32, u64)>,
+    /// Folded device of the directory being scanned: its files are on the same device.
+    dev: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -238,6 +240,13 @@ fn process_entry(
         acc.entry_count += 1;
         return;
     }
+    // -I / -X patterns apply to files too (like ncdu's --exclude), not just directories
+    if need_path && opts.ignore.has_path_rules() {
+        let joined = parent_path.unwrap().join(OsStr::from_bytes(bytes));
+        if opts.ignore.skip_path(&joined.to_string_lossy()) {
+            return;
+        }
+    }
     let st = match st {
         Some(s) => s,
         None => match statat(fd, cname, AtFlags::SYMLINK_NOFOLLOW) {
@@ -260,7 +269,7 @@ fn process_entry(
     if nlink > 1
         && acc
             .links
-            .insert((st.st_dev as u64, st.st_ino as u64), (fsize, fusage))
+            .insert((acc.dev, st.st_ino as u64), (fsize, fusage))
             .is_some()
     {
         acc.total_size -= fsize;
@@ -295,8 +304,9 @@ fn read_entries(
     let mut rd = RawDir::new(fd, &mut buf);
     while let Some(entry) = rd.next() {
         let Ok(entry) = entry else {
+            // RawDir does not advance after a failed getdents, so retrying would spin forever
             acc.flag = '!';
-            continue;
+            break;
         };
         process_entry(
             fd,
@@ -416,6 +426,7 @@ fn scan_dir(
             dir.usage = own_usage;
             if let Some(ext) = dir.dir_ext_mut() {
                 ext.own_usage = own_usage;
+                ext.dev = dev.map_or(0, fold_dev);
             }
             return Some(ScanOut::Node(dir, LinkMap::default()));
         }
@@ -442,6 +453,7 @@ fn scan_dir(
         had_entries: false,
         flag: ' ',
         links: LinkMap::default(),
+        dev: dev.map_or(0, fold_dev),
     };
 
     read_entries(
@@ -469,143 +481,75 @@ fn scan_dir(
 
     let mut has_err_child = false;
     let pfd = fd.as_fd();
-    match subdirs.len() {
-        0 => {}
-        1 => {
-            let s = subdirs.pop().unwrap();
-            if let Some(sub) = scan_dir(
-                Some(pfd),
-                s.raw_os.as_deref(),
-                s.path.as_deref(),
-                s.name,
-                depth + 1,
-                keep_depth,
-                need_path,
-                s.pre_stat,
-                my_dev,
-                opts,
-                prog,
-            ) {
-                acc.had_entries = true;
-                match sub {
-                    ScanOut::Node(item, links) => {
-                        merge_links(
-                            &mut acc.total_size,
-                            &mut acc.total_usage,
-                            &mut acc.links,
-                            links,
-                        );
-                        acc.total_size += item.size;
-                        acc.total_usage += item.usage;
-                        acc.total_items += item.items();
-                        if item.mtime > acc.max_mtime {
-                            acc.max_mtime = item.mtime;
-                        }
-                        let sf = item.flag();
-                        if sf == '!' || sf == '.' {
-                            has_err_child = true;
-                        }
-                        if keep_children {
-                            children.push(item);
-                        }
-                    }
-                    ScanOut::Stats {
-                        size,
-                        usage,
-                        items,
-                        mtime: smtime,
-                        flag: sf,
-                        links,
-                    } => {
-                        merge_links(
-                            &mut acc.total_size,
-                            &mut acc.total_usage,
-                            &mut acc.links,
-                            links,
-                        );
-                        acc.total_size += size;
-                        acc.total_usage += usage;
-                        acc.total_items += items;
-                        if smtime > acc.max_mtime {
-                            acc.max_mtime = smtime;
-                        }
-                        if sf == '!' || sf == '.' {
-                            has_err_child = true;
-                        }
-                    }
+    let scan_sub = |s: SubdirEntry| {
+        scan_dir(
+            Some(pfd),
+            s.raw_os.as_deref(),
+            s.path.as_deref(),
+            s.name,
+            depth + 1,
+            keep_depth,
+            need_path,
+            s.pre_stat,
+            my_dev,
+            opts,
+            prog,
+        )
+    };
+    let subs: Vec<ScanOut> = match subdirs.len() {
+        0 => Vec::new(),
+        1 => scan_sub(subdirs.pop().unwrap()).into_iter().collect(),
+        _ => subdirs.into_par_iter().filter_map(scan_sub).collect(),
+    };
+    if keep_children {
+        children.reserve(subs.len());
+    }
+    for sub in subs {
+        acc.had_entries = true;
+        match sub {
+            ScanOut::Node(item, links) => {
+                merge_links(
+                    &mut acc.total_size,
+                    &mut acc.total_usage,
+                    &mut acc.links,
+                    links,
+                );
+                acc.total_size += item.size;
+                acc.total_usage += item.usage;
+                acc.total_items += item.items();
+                if item.mtime > acc.max_mtime {
+                    acc.max_mtime = item.mtime;
+                }
+                let sf = item.flag();
+                if sf == '!' || sf == '.' {
+                    has_err_child = true;
+                }
+                if keep_children {
+                    children.push(item);
                 }
             }
-        }
-        _ => {
-            let subs: Vec<ScanOut> = subdirs
-                .into_par_iter()
-                .filter_map(|s| {
-                    scan_dir(
-                        Some(pfd),
-                        s.raw_os.as_deref(),
-                        s.path.as_deref(),
-                        s.name,
-                        depth + 1,
-                        keep_depth,
-                        need_path,
-                        s.pre_stat,
-                        my_dev,
-                        opts,
-                        prog,
-                    )
-                })
-                .collect();
-            if keep_children {
-                children.reserve(subs.len());
-            }
-            for sub in subs {
-                acc.had_entries = true;
-                match sub {
-                    ScanOut::Node(item, links) => {
-                        merge_links(
-                            &mut acc.total_size,
-                            &mut acc.total_usage,
-                            &mut acc.links,
-                            links,
-                        );
-                        acc.total_size += item.size;
-                        acc.total_usage += item.usage;
-                        acc.total_items += item.items();
-                        if item.mtime > acc.max_mtime {
-                            acc.max_mtime = item.mtime;
-                        }
-                        let sf = item.flag();
-                        if sf == '!' || sf == '.' {
-                            has_err_child = true;
-                        }
-                        if keep_children {
-                            children.push(item);
-                        }
-                    }
-                    ScanOut::Stats {
-                        size,
-                        usage,
-                        items,
-                        mtime: smtime,
-                        flag: sf,
-                        links,
-                    } => {
-                        merge_links(
-                            &mut acc.total_size,
-                            &mut acc.total_usage,
-                            &mut acc.links,
-                            links,
-                        );
-                        acc.total_size += size;
-                        acc.total_usage += usage;
-                        acc.total_items += items;
-                        if smtime > acc.max_mtime {
-                            acc.max_mtime = smtime;
-                        }
-                        if sf == '!' || sf == '.' {
-                            has_err_child = true;
-                        }
-                    }
+            ScanOut::Stats {
+                size,
+                usage,
+                items,
+                mtime: smtime,
+                flag: sf,
+                links,
+            } => {
+                merge_links(
+                    &mut acc.total_size,
+                    &mut acc.total_usage,
+                    &mut acc.links,
+                    links,
+                );
+                acc.total_size += size;
+                acc.total_usage += usage;
+                acc.total_items += items;
+                if smtime > acc.max_mtime {
+                    acc.max_mtime = smtime;
+                }
+                if sf == '!' || sf == '.' {
+                    has_err_child = true;
                 }
             }
         }
@@ -628,6 +572,7 @@ fn scan_dir(
         dir.mtime = acc.max_mtime;
         if let Some(ext) = dir.dir_ext_mut() {
             ext.own_usage = own_usage;
+            ext.dev = dev.map_or(0, fold_dev);
             ext.items = acc.total_items;
             ext.children = children;
         }

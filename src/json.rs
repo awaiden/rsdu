@@ -1,4 +1,4 @@
-use crate::tree::{EMPTY_DIR_SIZE, Item, SmallStr};
+use crate::tree::{EMPTY_DIR_SIZE, Item, SmallStr, fold_dev};
 use std::io::{self, Write};
 
 /// `--output-attrs` selection; empty means everything.
@@ -9,7 +9,6 @@ pub struct Attrs(pub Vec<String>);
 struct AttrFlags {
     asize: bool,
     dsize: bool,
-    items: bool,
     mtime: bool,
     notreg: bool,
     ino: bool,
@@ -24,7 +23,6 @@ impl Attrs {
         AttrFlags {
             asize: self.has("asize"),
             dsize: self.has("dsize"),
-            items: self.has("items"),
             mtime: self.has("mtime"),
             notreg: self.has("notreg"),
             ino: self.has("ino"),
@@ -84,21 +82,22 @@ pub fn export(root: &Item, attrs: &Attrs, out: &mut impl Write) -> io::Result<()
         env!("CARGO_PKG_VERSION")
     )?;
     let flags = attrs.flags();
-    write_dir(root, flags, out)?;
+    write_dir(root, 0, flags, out)?;
     out.write_all(b"]\n")
 }
 
-fn write_dir(d: &Item, a: AttrFlags, w: &mut impl Write) -> io::Result<()> {
+/// Directory entries follow ncdu's format: `dsize` is the directory's own usage (readers add up
+/// the children), and `dev` appears on the root and wherever it differs from the parent.
+fn write_dir(d: &Item, parent_dev: u32, a: AttrFlags, w: &mut impl Write) -> io::Result<()> {
     w.write_all(b"[{\"name\":")?;
     write_json_str(w, &d.name)?;
-    if a.asize {
-        write_kv_i64(w, b",\"asize\":", d.size)?;
+    let own = d.dir_ext().map_or(0, |e| e.own_usage);
+    if a.dsize && own > 0 {
+        write_kv_i64(w, b",\"dsize\":", own)?;
     }
-    if a.dsize {
-        write_kv_i64(w, b",\"dsize\":", d.usage)?;
-    }
-    if a.items {
-        write_kv_i64(w, b",\"items\":", d.items())?;
+    let dev = d.dir_ext().map_or(0, |e| e.dev);
+    if dev != 0 && dev != parent_dev {
+        write_kv_i64(w, b",\"dev\":", i64::from(dev))?;
     }
     if a.mtime && d.mtime != 0 {
         write_kv_i64(w, b",\"mtime\":", d.mtime)?;
@@ -106,6 +105,8 @@ fn write_dir(d: &Item, a: AttrFlags, w: &mut impl Write) -> io::Result<()> {
     if d.flag() == '!' {
         w.write_all(b",\"read_error\":true")?;
     }
+    // children inherit this directory's device unless they state their own
+    let eff_dev = if dev != 0 { dev } else { parent_dev };
     let children = d.children();
     if !children.is_empty() {
         w.write_all(b"},\n")?;
@@ -117,7 +118,7 @@ fn write_dir(d: &Item, a: AttrFlags, w: &mut impl Write) -> io::Result<()> {
             w.write_all(b",\n")?;
         }
         if c.is_dir() {
-            write_dir(c, a, w)?;
+            write_dir(c, eff_dev, a, w)?;
         } else {
             write_file(c, a, w)?;
         }
@@ -156,6 +157,15 @@ type MetaResult = Result<(Item, Option<i64>, Option<i64>, Option<i64>), String>;
 struct Parser<'a> {
     b: &'a [u8],
     pos: usize,
+    /// Directory sizes are cumulative (gdu, rsdu 0.1.0) instead of own-only (ncdu).
+    legacy: bool,
+    /// `dev` of the directory object parse_meta just read, if it had one.
+    meta_dev: Option<u32>,
+}
+
+/// A name that could point outside the scanned directory when joined onto a path.
+fn bad_name(n: &str) -> bool {
+    n.is_empty() || n == "." || n == ".." || n.contains(['/', '\0'])
 }
 
 impl<'a> Parser<'a> {
@@ -386,6 +396,7 @@ impl<'a> Parser<'a> {
         let mut items: Option<i64> = None;
         let mut mtime: i64 = 0;
         let mut ino: u64 = 0;
+        let mut dev: Option<u32> = None;
         let mut read_error = false;
         let mut notreg = false;
         let mut hlnkc = false;
@@ -420,6 +431,7 @@ impl<'a> Parser<'a> {
                 b"items" => items = self.parse_i64().ok(),
                 b"mtime" => mtime = self.parse_i64().unwrap_or(0),
                 b"ino" => ino = self.parse_i64().unwrap_or(0) as u64,
+                b"dev" => dev = self.parse_i64().ok().map(|v| fold_dev(v as u64)),
                 b"read_error" => read_error = self.parse_bool().unwrap_or(false),
                 b"notreg" => {
                     let _ = self.skip_value();
@@ -442,10 +454,14 @@ impl<'a> Parser<'a> {
         };
 
         if is_dir {
+            self.meta_dev = dev;
             let mut d = Item::new_dir(name, if read_error { '!' } else { ' ' });
             d.mtime = mtime;
             Ok((d, asize, dsize, items))
         } else {
+            if bad_name(&name) {
+                return Err("invalid item name".into());
+            }
             let flag = if hlnkc {
                 'H'
             } else if notreg {
@@ -465,13 +481,17 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_dir(&mut self) -> Result<Item, String> {
+    fn parse_dir(&mut self, inherited_dev: u32) -> Result<Item, String> {
         match self.next_non_ws()? {
             b']' => return Err("directory array is empty".into()),
             b'{' => {}
             _ => return Err("directory item is not a map".into()),
         }
         let (mut d, size, usage, count) = self.parse_meta(true)?;
+        let dev = self.meta_dev.take().unwrap_or(inherited_dev);
+        if let Some(ext) = d.dir_ext_mut() {
+            ext.dev = dev;
+        }
 
         loop {
             match self.next_non_ws()? {
@@ -482,9 +502,12 @@ impl<'a> Parser<'a> {
                         d.children_mut().push(f);
                     }
                     b'[' => {
-                        let mut c = self.parse_dir()?;
+                        let mut c = self.parse_dir(dev)?;
                         if let Some(p) = c.name.rfind('/') {
                             c.name = SmallStr::from(&c.name[p + 1..]);
+                        }
+                        if bad_name(&c.name) {
+                            return Err("invalid item name".into());
                         }
                         d.children_mut().push(c);
                     }
@@ -495,14 +518,20 @@ impl<'a> Parser<'a> {
         }
 
         if let Some(u) = usage {
-            d.usage = u;
-            let kids: i64 = d.children().iter().map(|c| c.usage).sum();
-            if let Some(ext) = d.dir_ext_mut() {
-                ext.own_usage = (u - kids).max(0);
+            if self.legacy {
+                // cumulative total: what is left after the children is the directory's own usage
+                d.usage = u;
+                let kids: i64 = d.children().iter().map(|c| c.usage).sum();
+                if let Some(ext) = d.dir_ext_mut() {
+                    ext.own_usage = (u - kids).max(0);
+                }
+            } else if let Some(ext) = d.dir_ext_mut() {
+                ext.own_usage = u.max(0);
             }
         }
-        // depth-truncated leaf: pin the exported totals instead of recomputing
-        if let (Some(sz), Some(u), Some(n), true) = (size, usage, count, d.children().is_empty())
+        // depth-truncated leaf (cumulative formats only): pin the exported totals
+        if let (true, Some(sz), Some(u), Some(n), true) =
+            (self.legacy, size, usage, count, d.children().is_empty())
             && !(n == 1 && sz == EMPTY_DIR_SIZE)
         {
             d.size = sz;
@@ -520,16 +549,28 @@ pub fn import(input: &str) -> Result<Item, String> {
     let mut p = Parser {
         b: input.as_bytes(),
         pos: 0,
+        legacy: false,
+        meta_dev: None,
     };
     if p.next_non_ws()? != b'[' {
         return Err("JSON file does not contain top level array".into());
     }
     // Elements 0, 1, 2 (major, minor, metadata)
-    for _ in 0..3 {
+    for i in 0..3 {
         if p.peek() == Some(b']') {
             return Err("top level array must have at least 4 items".into());
         }
+        p.ws();
+        let start = p.pos;
         p.skip_value()?;
+        if i == 2 {
+            // gdu and rsdu 0.1.0 wrote cumulative directory totals; ncdu and newer rsdu own sizes
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&p.b[start..p.pos]) {
+                let name = meta["progname"].as_str().unwrap_or("");
+                let ver = meta["progver"].as_str().unwrap_or("");
+                p.legacy = name == "gdu" || (name == "rsdu" && ver == "0.1.0");
+            }
+        }
         if p.next_non_ws()? != b',' {
             return Err("top level array must have at least 4 items".into());
         }
@@ -537,7 +578,7 @@ pub fn import(input: &str) -> Result<Item, String> {
     if p.next_non_ws()? != b'[' {
         return Err("array of maps not found in the top level array on 4th position".into());
     }
-    let mut root = p.parse_dir()?;
+    let mut root = p.parse_dir(0)?;
     root.update_stats();
     Ok(root)
 }
@@ -546,22 +587,76 @@ pub fn import(input: &str) -> Result<Item, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn roundtrip() {
+    fn tree() -> Item {
         let mk = |n: &str, sz| Item::new_file(n, ' ', sz, sz, 5, 0);
+        let hl = |n: &str| Item::new_file(n, 'H', 40, 4096, 5, 77);
         let mut root = Item::new_dir("/r", ' ');
+        root.dir_ext_mut().unwrap().own_usage = 4096;
         let mut sub = Item::new_dir("s", ' ');
+        sub.dir_ext_mut().unwrap().own_usage = 4096;
         sub.children_mut().push(mk("f", 100));
+        sub.children_mut().push(hl("link-a"));
         root.children_mut().push(sub);
         root.children_mut().push(mk("g", 7));
+        root.children_mut().push(hl("link-b"));
         root.update_stats();
+        root
+    }
+
+    fn totals(i: &Item) -> (i64, i64, i64) {
+        (i.size, i.usage, i.items())
+    }
+
+    #[test]
+    fn roundtrip() {
+        let root = tree();
         let mut buf = Vec::new();
         export(&root, &Attrs::default(), &mut buf).unwrap();
-        let back = import(std::str::from_utf8(&buf).unwrap()).unwrap();
-        assert_eq!(
-            (back.size, back.usage, back.items()),
-            (root.size, root.usage, root.items())
-        );
+        let text = std::str::from_utf8(&buf).unwrap();
+        // ncdu semantics: directories carry only their own usage, never a cumulative total
+        assert!(text.contains(r#"{"name":"/r","dsize":4096"#), "{text}");
+        assert!(!text.contains("\"items\""), "{text}");
+        let back = import(text).unwrap();
+        assert_eq!(totals(&back), totals(&root));
         assert_eq!(back.children()[0].children()[0].name, "f");
+        // the hardlinked inode is counted once for the whole tree, once for the subdir
+        assert_eq!(root.usage, 4096 + 4096 + 100 + 7 + 4096);
+    }
+
+    #[test]
+    fn imports_ncdu_own_sizes() {
+        let j = r#"[1,2,{"progname":"ncdu","progver":"2.9.1","timestamp":1},
+[{"name":"/r","dsize":4096},
+{"name":"a","asize":10,"dsize":4096},
+[{"name":"d","asize":4096,"dsize":4096,"dev":9},
+{"name":"f","asize":100,"dsize":8192}]]]"#;
+        let r = import(j).unwrap();
+        assert_eq!(r.usage, 4096 + 4096 + 4096 + 8192);
+        assert_eq!(r.size, 10 + 100);
+        assert_eq!(r.items(), 4);
+        // `dev` is inherited by everything below the directory that states it
+        assert_eq!(r.children()[1].dir_ext().unwrap().dev, fold_dev(9));
+    }
+
+    #[test]
+    fn imports_legacy_cumulative_totals() {
+        // gdu writes the cumulative size for directories; own usage is what the children leave
+        let j = r#"[1,2,{"progname":"gdu","progver":"5.32.0","timestamp":1},
+[{"name":"/r","asize":10,"dsize":8192,"items":2},
+{"name":"a","asize":10,"dsize":4096}]]"#;
+        let r = import(j).unwrap();
+        assert_eq!((r.size, r.usage), (10, 8192));
+    }
+
+    #[test]
+    fn rejects_names_that_escape_the_root() {
+        for bad in ["../x", "/etc/passwd", "a/b", "..", "."] {
+            let j = format!(
+                r#"[1,2,{{"progname":"ncdu"}},[{{"name":"/r"}},{{"name":{bad:?},"asize":1}}]]"#
+            );
+            assert_eq!(import(&j).unwrap_err(), "invalid item name", "{bad}");
+        }
+        let j = r#"[1,2,{"progname":"ncdu"},[{"name":"/r"},[{"name":".."}]]]"#;
+        assert_eq!(import(j).unwrap_err(), "invalid item name");
     }
 }

@@ -58,6 +58,8 @@ struct App {
     deleting: Option<Deleting>,
     /// (text, is_error)
     status: Option<(String, bool)>,
+    /// Something changed since the last draw (idle browsing needs no redraw).
+    dirty: bool,
 }
 
 fn cur<'a>(root: &'a Item, path: &[usize]) -> &'a Item {
@@ -101,6 +103,7 @@ pub fn run(src: Source, cfg: Cfg) -> io::Result<()> {
         scanning: None,
         deleting: None,
         status: None,
+        dirty: true,
     };
     match src {
         Source::Ready(root) => app.set_root(root),
@@ -116,16 +119,26 @@ pub fn run(src: Source, cfg: Cfg) -> io::Result<()> {
     let mut term = ratatui::init();
     let res = (|| loop {
         app.tick();
-        term.draw(|f| app.draw(f))?;
+        // scanning and deleting animate (spinner, counters); otherwise draw only after a change
+        if app.dirty || app.scanning.is_some() || app.deleting.is_some() {
+            term.draw(|f| app.draw(f))?;
+            app.dirty = false;
+        }
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        let Event::Key(k) = event::read()? else {
-            continue;
+        let k = match event::read()? {
+            Event::Key(k) => k,
+            Event::Resize(..) => {
+                app.dirty = true;
+                continue;
+            }
+            _ => continue,
         };
         if k.kind != KeyEventKind::Press {
             continue;
         }
+        app.dirty = true;
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             return Ok(());
         }
@@ -207,6 +220,7 @@ impl App {
                 Ok(root) => self.set_root(root),
                 Err(_) => self.status = Some(("Scan thread panicked".into(), true)),
             }
+            self.dirty = true;
         }
         if self
             .deleting
@@ -217,6 +231,8 @@ impl App {
             self.status = Some(match d.handle.join() {
                 Ok(Ok(())) => {
                     self.root.delete_child(&d.path, d.idx);
+                    // totals changed, so sibling order may have too
+                    self.resort();
                     let n = cur(&self.root, &self.path).children().len();
                     self.sel
                         .select(if n == 0 { None } else { Some(d.idx.min(n - 1)) });
@@ -228,6 +244,7 @@ impl App {
                 Ok(Err(e)) => (format!("Error deleting {}: {e}", d.name), true),
                 Err(_) => (format!("Delete of {} panicked", d.name), true),
             });
+            self.dirty = true;
         }
     }
 
@@ -297,7 +314,10 @@ impl App {
             KeyCode::Char('M') => self.set_sort(SortBy::Mtime),
             KeyCode::Char('d') => {
                 if self.cfg.no_delete {
-                    self.status = Some(("Deletion is disabled (--no-delete)".into(), true));
+                    self.status = Some((
+                        "Deletion is disabled (--no-delete or imported file)".into(),
+                        true,
+                    ));
                 } else if n > 0 {
                     self.confirm = true;
                 }
