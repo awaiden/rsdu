@@ -37,12 +37,14 @@ impl Progress {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Opts {
     pub ignore: Ignore,
     pub no_cross: bool,
     /// Maximum tree depth to retain child `Item`s for (`None` keeps full tree).
     pub max_depth: Option<usize>,
+    /// Device of the original scan root, set when rescanning a subdirectory with `--no-cross`.
+    pub root_dev: Option<u64>,
 }
 
 /// File item from raw stat fields; `special` is a symlink or socket.
@@ -125,6 +127,7 @@ pub fn scan(path: &Path, opts: &Opts, prog: &Progress) -> Item {
         ignore: opts.ignore.scoped_to(&root_str),
         no_cross: opts.no_cross,
         max_depth: opts.max_depth,
+        root_dev: opts.root_dev,
     };
     let need_path = scoped_opts.ignore.has_path_rules() || prog.active;
     let keep_depth = scoped_opts.max_depth.unwrap_or(usize::MAX);
@@ -136,7 +139,7 @@ pub fn scan(path: &Path, opts: &Opts, prog: &Progress) -> Item {
         keep_depth,
         need_path,
         None,
-        None,
+        opts.root_dev,
         &scoped_opts,
         prog,
     ) {
@@ -663,6 +666,7 @@ mod tests {
             ignore: Ignore::default(),
             no_cross: false,
             max_depth: None,
+            root_dev: None,
         };
         // every run must give the same answer whatever order the threads finish in
         for _ in 0..20 {
@@ -694,6 +698,24 @@ mod tests {
             .position(|c| c.name.as_os_str().as_bytes() == b"dir\xfe")
             .unwrap();
         assert!(fs::symlink_metadata(r.path_of(&[di], 0)).is_ok());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn rescan_subdir_updates_totals() {
+        let d = std::env::temp_dir().join(format!("rsdu-rescan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("sub/a"), vec![1u8; 1000]).unwrap();
+        let o = Opts::default();
+        let mut root = scan(&d, &o, &Progress::default());
+        let before = root.size;
+        fs::write(d.join("sub/b"), vec![1u8; 5000]).unwrap();
+        let mut sub = scan(&d.join("sub"), &o, &Progress::default());
+        sub.name = SmallStr::from("sub");
+        root.replace_at(&[0], sub);
+        assert_eq!(root.size, before + 5000);
+        assert_eq!(root.children()[0].children().len(), 2);
         fs::remove_dir_all(&d).unwrap();
     }
 }

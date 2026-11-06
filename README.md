@@ -46,6 +46,7 @@ rsdu -I '.*\.log' /var    # skip paths matching a regex (files and directories)
 | `c` `m`                               | show item count / mtime column                         |
 | `s` `C` `n` `M`                       | sort by size / count / name / mtime (again to reverse) |
 | `i`                                   | item info (path, sizes, mtime, owner, links)           |
+| `r`                                   | rescan the current directory (not for `-f` imports)    |
 | `d`                                   | delete (asks for confirmation)                         |
 | `?` / `q`                             | help / quit                                            |
 

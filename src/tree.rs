@@ -536,6 +536,12 @@ impl Item {
         p
     }
 
+    /// Replace the dir at `path` with a freshly scanned one and recompute every total.
+    pub fn replace_at(&mut self, path: &[usize], item: Item) {
+        *self.dir_at(path) = item;
+        self.update_stats();
+    }
+
     pub fn dir_at(&mut self, path: &[usize]) -> &mut Item {
         path.iter().fold(self, |d, &i| &mut d.children_mut()[i])
     }
@@ -554,6 +560,24 @@ mod tests {
         d.dir_ext_mut().unwrap().dev = dev;
         *d.children_mut() = kids;
         d
+    }
+
+    #[test]
+    fn replace_at_recounts_hardlinks() {
+        let mut root = dir(
+            "r",
+            1,
+            vec![
+                dir("a", 1, vec![file("x", 5)]),
+                dir("b", 1, vec![file("y", 5)]),
+            ],
+        );
+        root.update_stats();
+        let a = root.children()[0].size;
+        assert_eq!(root.size, a, "hardlink counted once");
+        root.replace_at(&[1], dir("b", 1, vec![file("z", 0)]));
+        assert_eq!(root.size, a + root.children()[1].size);
+        assert!(root.children()[1].size > 0);
     }
 
     #[test]

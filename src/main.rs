@@ -168,7 +168,7 @@ fn main() {
     let batch =
         a.non_interactive || a.summarize || a.top > 0 || a.depth > 0 || (!tty && !a.interactive);
     let interactive = !batch && a.output_file.is_none();
-    let tui_cfg = || tui::Cfg {
+    let tui_cfg = |scan_opts: Option<scan::Opts>| tui::Cfg {
         fmt: Fmt {
             si: a.si,
             ..Default::default()
@@ -180,7 +180,7 @@ fn main() {
         no_unicode: a.no_unicode,
         // an imported file's names are not guaranteed to exist on this machine
         no_delete: a.no_delete || a.input_file.is_some(),
-        live: a.input_file.is_none(),
+        scan_opts,
     };
 
     let mut root = if let Some(f) = &a.input_file {
@@ -221,13 +221,15 @@ fn main() {
                 .unwrap_or_else(|e| die(e)),
             no_cross: a.no_cross,
             max_depth,
+            root_dev: None,
         };
         if interactive {
             // scan on a worker thread so the TUI can show live progress
             let prog = std::sync::Arc::new(scan::Progress::active());
             let p = prog.clone();
+            let cfg = tui_cfg(Some(opts.clone()));
             let handle = std::thread::spawn(move || scan::scan(&abs, &opts, &p));
-            tui::run(tui::Source::Scanning(handle, prog, scan_path), tui_cfg())
+            tui::run(tui::Source::Scanning(handle, prog, scan_path), cfg)
                 .unwrap_or_else(|e| die(e));
             return;
         }
@@ -297,6 +299,6 @@ fn main() {
             .unwrap_or_else(|e| die(e));
         std::mem::forget(root); // exiting anyway: skip freeing ~1 allocation per item
     } else {
-        tui::run(tui::Source::Ready(root), tui_cfg()).unwrap_or_else(|e| die(e));
+        tui::run(tui::Source::Ready(root), tui_cfg(None)).unwrap_or_else(|e| die(e));
     }
 }

@@ -21,8 +21,8 @@ pub struct Cfg {
     pub no_color: bool,
     pub no_unicode: bool,
     pub no_delete: bool,
-    /// Scanned from the live filesystem (not imported), so item paths can be stat'ed.
-    pub live: bool,
+    /// Set when scanned from the live filesystem (not imported): enables `r` and live stat in `i`.
+    pub scan_opts: Option<crate::scan::Opts>,
 }
 
 pub enum Source {
@@ -36,6 +36,8 @@ struct Scanning {
     prog: Arc<Progress>,
     path: String,
     started: Instant,
+    /// None: the initial scan. Some(path): rescan of the directory at that tree path.
+    target: Option<Vec<usize>>,
 }
 
 struct Deleting {
@@ -104,6 +106,7 @@ pub fn run(src: Source, cfg: Cfg) -> io::Result<()> {
                 prog,
                 path,
                 started: Instant::now(),
+                target: None,
             })
         }
     }
@@ -225,7 +228,7 @@ impl App {
         if let Some(s) = status {
             v.push(l("Status", s.into()));
         }
-        if self.cfg.live
+        if self.cfg.scan_opts.is_some()
             && let Ok(m) = std::fs::symlink_metadata(&p)
         {
             use std::os::unix::fs::MetadataExt;
@@ -268,9 +271,16 @@ impl App {
             .is_some_and(|s| s.handle.is_finished())
         {
             let s = self.scanning.take().unwrap();
-            match s.handle.join() {
-                Ok(root) => self.set_root(root),
-                Err(_) => self.status = Some(("Scan thread panicked".into(), true)),
+            match (s.handle.join(), s.target) {
+                (Ok(root), None) => self.set_root(root),
+                (Ok(mut item), Some(path)) => {
+                    item.name = self.root.dir_at(&path).name.clone();
+                    self.root.replace_at(&path, item);
+                    self.resort();
+                    let n = cur(&self.root, &self.path).children().len();
+                    self.sel.select((n > 0).then_some(0));
+                }
+                (Err(_), _) => self.status = Some(("Scan thread panicked".into(), true)),
             }
             self.dirty = true;
         }
@@ -326,6 +336,7 @@ impl App {
         match code {
             KeyCode::Char('q' | 'Q') => return true,
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('r') => self.start_rescan(),
             KeyCode::Char('i') if n > 0 => self.info = Some(self.info_lines(i)),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.sel.select(Some((i + 1).min(n.saturating_sub(1))))
@@ -379,6 +390,36 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Rescan the directory being viewed on a worker thread (the whole tree when at the root).
+    fn start_rescan(&mut self) {
+        let Some(mut opts) = self.cfg.scan_opts.clone() else {
+            self.status = Some(("Rescan is not available for imported files".into(), true));
+            return;
+        };
+        let p = match self.path.split_last() {
+            None => std::path::PathBuf::from(&self.root.name),
+            Some((&i, up)) => {
+                // keep `--no-cross` anchored to the original root's device
+                if opts.no_cross {
+                    opts.root_dev = std::fs::symlink_metadata(&self.root.name)
+                        .ok()
+                        .map(|m| std::os::unix::fs::MetadataExt::dev(&m));
+                }
+                self.root.path_of(up, i)
+            }
+        };
+        let prog = Arc::new(Progress::active());
+        let pr = prog.clone();
+        let pp = p.clone();
+        self.scanning = Some(Scanning {
+            handle: std::thread::spawn(move || crate::scan::scan(&pp, &opts, &pr)),
+            prog,
+            path: p.to_string_lossy().into_owned(),
+            started: Instant::now(),
+            target: Some(self.path.clone()),
+        });
     }
 
     fn start_delete(&mut self) {
@@ -637,6 +678,7 @@ impl App {
                 k("s C n M", "sort by size/count/name/mtime"),
                 k("", "(again = reverse)"),
                 k("i", "item info"),
+                k("r", "rescan current directory"),
                 k("d", "delete"),
                 k("q", "quit"),
                 Line::from(""),
@@ -698,7 +740,7 @@ mod tests {
             no_color: true,
             no_unicode: true,
             no_delete: false,
-            live: false,
+            scan_opts: None,
         });
         app.set_root(root);
         for (name, want) in [("f.txt", "file (hardlink)"), ("sub", "directory")] {
