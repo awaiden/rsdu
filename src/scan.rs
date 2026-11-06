@@ -679,6 +679,8 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
+    // APFS rejects non-UTF-8 file names
+    #[cfg(target_os = "linux")]
     #[test]
     fn non_utf8_names_resolve_to_real_paths() {
         let d = std::env::temp_dir().join(format!("rsdu-raw-{}", std::process::id()));
