@@ -61,21 +61,21 @@ directories; use `-X FILE` to read many patterns from a file.
 
 ## Benchmarks
 
-Scan time, warm cache, mean of 7 interleaved runs, 12-core machine. All three tools build the
+Scan time, warm cache, mean of 5 interleaved runs, 12-core machine. All three tools build the
 full tree and write a JSON export to `/dev/null` (`rsdu -n -p -o /dev/null`,
 `gdu -n -p -o /dev/null`, `ncdu -0 -x -t 12 -o /dev/null`):
 
 | Tree                          | rsdu   | gdu 5.32 | ncdu 2.9.1 (`-t 12`) |
 | ----------------------------- | ------ | -------- | -------------------- |
-| `/usr` (247k entries)         | 69 ms  | 262 ms   | 86 ms                |
-| `~/Documents` (1.15M entries) | 372 ms | 1562 ms  | 478 ms               |
+| `/usr` (247k entries)         | 67 ms  | 242 ms   | 86 ms                |
+| `~/Documents` (1.15M entries) | 324 ms | 1369 ms  | 496 ms               |
 
-Peak memory on `~/Documents`: rsdu 198 MB, ncdu 78 MB, gdu 1.2 GB.
+Peak memory on `~/Documents`: rsdu 186 MB, ncdu 79 MB, gdu 1.1 GB.
 
-rsdu is about 4x to 4.2x faster than gdu and 20-22% faster than ncdu running on all cores
+rsdu is about 3.6x to 4.2x faster than gdu and 22-35% faster than ncdu running on all cores
 (ncdu's default is one thread, which took 1712 ms on `~/Documents` in an earlier run).
 When only a total is needed (`rsdu -n -s`), rsdu does not keep the tree and finishes in
-53 ms on `/usr` and 272 ms on `~/Documents` using about 75 MB.
+46 ms on `/usr` and 239 ms on `~/Documents` using about 76 MB.
 
 Hardlinked files are counted once per directory subtree, so results are identical from run
 to run regardless of thread timing.
